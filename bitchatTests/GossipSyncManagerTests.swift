@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import BitFoundation
 @testable import bitchat
 
 struct GossipSyncManagerTests {
@@ -7,12 +8,14 @@ struct GossipSyncManagerTests {
     private let myPeerID = PeerID(str: "0102030405060708")
     
     @Test func concurrentPacketIntakeAndSyncRequest() async throws {
-        let manager = GossipSyncManager(myPeerID: myPeerID)
+        let requestSyncManager = RequestSyncManager()
+        let manager = GossipSyncManager(myPeerID: myPeerID, requestSyncManager: requestSyncManager)
         let delegate = RecordingDelegate()
         manager.delegate = delegate
 
         try await confirmation("sync request sent") { sent in
             delegate.onSend = {
+                delegate.onSend = nil
                 sent()
             }
 
@@ -34,7 +37,7 @@ struct GossipSyncManagerTests {
             }
 
             manager.scheduleInitialSyncToPeer(PeerID(str: "FFFFFFFFFFFFFFFF"), delaySeconds: 0.0)
-            try await sleep(0.002)
+            try await TestHelpers.waitFor({ delegate.lastPacket != nil }, timeout: TestConstants.shortTimeout)
         }
 
         let lastPacket = try #require(delegate.lastPacket, "Expected sync packet to be sent")
@@ -47,7 +50,8 @@ struct GossipSyncManagerTests {
         config.stalePeerCleanupIntervalSeconds = 0
         config.stalePeerTimeoutSeconds = 5
 
-        let manager = GossipSyncManager(myPeerID: myPeerID, config: config)
+        let requestSyncManager = RequestSyncManager()
+        let manager = GossipSyncManager(myPeerID: myPeerID, config: config, requestSyncManager: requestSyncManager)
         let peerHex = "0011223344556677"
         let senderData = try #require(Data(hexString: peerHex))
         let initialTimestampMs = UInt64(Date().timeIntervalSince1970 * 1000)
@@ -92,7 +96,8 @@ struct GossipSyncManagerTests {
         config.stalePeerTimeoutSeconds = 5
         config.maxMessageAgeSeconds = 100
 
-        let manager = GossipSyncManager(myPeerID: myPeerID, config: config)
+        let requestSyncManager = RequestSyncManager()
+        let manager = GossipSyncManager(myPeerID: myPeerID, config: config, requestSyncManager: requestSyncManager)
         let peerHex = "8899aabbccddeeff"
         let senderData = try #require(Data(hexString: peerHex))
         let staleTimestampMs = UInt64(Date().addingTimeInterval(-(config.stalePeerTimeoutSeconds + 1)).timeIntervalSince1970 * 1000)
@@ -136,7 +141,8 @@ struct GossipSyncManagerTests {
         config.fileTransferSyncIntervalSeconds = 1
         config.maintenanceIntervalSeconds = 0
 
-        let manager = GossipSyncManager(myPeerID: myPeerID, config: config)
+        let requestSyncManager = RequestSyncManager()
+        let manager = GossipSyncManager(myPeerID: myPeerID, config: config, requestSyncManager: requestSyncManager)
         let delegate = RecordingDelegate()
         manager.delegate = delegate
 
@@ -189,12 +195,39 @@ struct GossipSyncManagerTests {
         manager._performMaintenanceSynchronously(now: Date())
 
         let sentPackets = delegate.packets
-        #expect(sentPackets.count == 3)
+        #expect(sentPackets.count == 1)
         let decoded = sentPackets.compactMap { RequestSyncPacket.decode(from: $0.payload) }
-        #expect(decoded.count == 3)
-        #expect(decoded[0].types == .publicMessages)
-        #expect(decoded[1].types == .fragment)
-        #expect(decoded[2].types == .fileTransfer)
+        #expect(decoded.count == 1)
+        let types = try #require(decoded.first?.types)
+        #expect(types.contains(.announce))
+        #expect(types.contains(.message))
+        #expect(types.contains(.fragment))
+        #expect(types.contains(.fileTransfer))
+    }
+
+    @Test func initialSyncCoalescesEnabledTypes() async throws {
+        var config = GossipSyncManager.Config()
+        config.seenCapacity = 10
+        config.fragmentCapacity = 5
+        config.fileTransferCapacity = 4
+        config.fragmentSyncIntervalSeconds = 1
+        config.fileTransferSyncIntervalSeconds = 1
+
+        let requestSyncManager = RequestSyncManager()
+        let manager = GossipSyncManager(myPeerID: myPeerID, config: config, requestSyncManager: requestSyncManager)
+        let delegate = RecordingDelegate()
+        manager.delegate = delegate
+
+        manager.scheduleInitialSyncToPeer(PeerID(str: "FFFFFFFFFFFFFFFF"), delaySeconds: 0.0)
+
+        try await TestHelpers.waitFor({ delegate.packets.count == 1 }, timeout: TestConstants.shortTimeout)
+        let packet = try #require(delegate.packets.first)
+        let request = try #require(RequestSyncPacket.decode(from: packet.payload))
+        let types = try #require(request.types)
+        #expect(types.contains(.announce))
+        #expect(types.contains(.message))
+        #expect(types.contains(.fragment))
+        #expect(types.contains(.fileTransfer))
     }
 
     @Test func handleRequestSyncHonorsTypeFilter() async throws {
@@ -206,7 +239,8 @@ struct GossipSyncManagerTests {
         config.fragmentSyncIntervalSeconds = 0
         config.fileTransferSyncIntervalSeconds = 0
 
-        let manager = GossipSyncManager(myPeerID: myPeerID, config: config)
+        let requestSyncManager = RequestSyncManager()
+        let manager = GossipSyncManager(myPeerID: myPeerID, config: config, requestSyncManager: requestSyncManager)
         let delegate = RecordingDelegate()
         manager.delegate = delegate
 
@@ -240,7 +274,7 @@ struct GossipSyncManagerTests {
         let request = RequestSyncPacket(p: 4, m: 1, data: Data(), types: .fragment)
         manager.handleRequestSync(from: peer, request: request)
 
-        try await sleep(0.01)
+        try await TestHelpers.waitFor({ delegate.packets.count == 1 }, timeout: TestConstants.shortTimeout)
         let sentPackets = delegate.packets
         #expect(sentPackets.count == 1)
         #expect(sentPackets[0].type == MessageType.fragment.rawValue)
@@ -267,5 +301,9 @@ private final class RecordingDelegate: GossipSyncManager.Delegate {
 
     func signPacketForBroadcast(_ packet: BitchatPacket) -> BitchatPacket {
         packet
+    }
+    
+    func getConnectedPeers() -> [PeerID] {
+        return []
     }
 }

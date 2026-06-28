@@ -9,11 +9,23 @@
 import CryptoKit
 import Foundation
 import Testing
-
+import BitFoundation
 @testable import bitchat
 
 // MARK: - Test Vector Support
 
+/// Official Noise test vectors (NoiseTestVectors.json) for
+/// `Noise_XX_25519_ChaChaPoly_SHA256` — the exact protocol this app speaks
+/// (see `NoiseProtocolName` / `NoisePattern.XX`). Embedded byte-for-byte from
+/// the two canonical community vector suites:
+/// - cacophony: https://raw.githubusercontent.com/haskell-cryptography/cacophony/master/vectors/cacophony.txt
+///   (6 messages: full XX handshake transcript + 3 transport messages, with
+///   `handshake_hash`)
+/// - snow: https://raw.githubusercontent.com/mcginty/snow/main/tests/vectors/snow.txt
+///   (5 messages: full XX handshake transcript + 2 transport messages)
+/// Plain XX has no PSKs and no pre-message keys; prologue is part of both
+/// vectors and is mixed via `NoiseHandshakeState(prologue:)`. Fixed ephemerals
+/// come in through the `predeterminedEphemeralKey` test seam.
 struct NoiseTestVector: Codable {
     let protocol_name: String
     let init_prologue: String
@@ -586,9 +598,16 @@ struct NoiseProtocolTests {
     @Test func noiseTestVectors() throws {
         // Load test vectors from bundle
         let testVectors = try loadTestVectors()
-        
+        #expect(!testVectors.isEmpty, "No Noise test vectors loaded from fixture")
+
+        // Every embedded vector must target the exact protocol the app uses.
+        let appProtocolName = NoiseProtocolName(pattern: NoisePattern.XX.patternName).fullName
+
         for (index, testVector) in testVectors.enumerated() {
             print("Running test vector \(index + 1): \(testVector.protocol_name)")
+            #expect(
+                testVector.protocol_name == appProtocolName,
+                "Vector \(index + 1) targets \(testVector.protocol_name), app speaks \(appProtocolName)")
             try runTestVector(testVector)
         }
     }
@@ -612,8 +631,13 @@ struct NoiseProtocolTests {
     }
     
     private func loadTestVectors() throws -> [NoiseTestVector] {
-        // Try to load from test bundle
+        // SwiftPM puts processed resources in the module bundle; the Xcode
+        // test target puts them in the test bundle itself.
+        #if SWIFT_PACKAGE
+        let testBundle = Bundle.module
+        #else
         let testBundle = Bundle(for: MockKeychain.self)
+        #endif
         guard let url = testBundle.url(forResource: "NoiseTestVectors", withExtension: "json")
         else {
             throw NSError(
@@ -746,8 +770,8 @@ struct NoiseProtocolTests {
         }
         
         // Get transport ciphers
-        let (initSend, initRecv) = try initiatorHandshake.getTransportCiphers(useExtractedNonce: false)
-        let (respSend, respRecv) = try responderHandshake.getTransportCiphers(useExtractedNonce: false)
+        let (initSend, initRecv, _) = try initiatorHandshake.getTransportCiphers(useExtractedNonce: false)
+        let (respSend, respRecv, _) = try responderHandshake.getTransportCiphers(useExtractedNonce: false)
 
         // Test transport messages (messages after the 3 handshake messages)
         for index in 3..<testVector.messages.count {
@@ -788,5 +812,160 @@ struct NoiseProtocolTests {
                 decrypted == payload,
                 "Message \(index + 1): Decrypted payload should match original")
         }
+    }
+
+    // MARK: - DH Shared Secret Clearing Tests
+
+    @Test func secureClearCalledDuringHandshake() throws {
+        // Use TrackingMockKeychain to verify secureClear is called
+        let trackingKeychain = TrackingMockKeychain()
+
+        let aliceKey = Curve25519.KeyAgreement.PrivateKey()
+        let bobKey = Curve25519.KeyAgreement.PrivateKey()
+
+        let alice = NoiseSession(
+            peerID: PeerID(str: "alice-test"),
+            role: .initiator,
+            keychain: trackingKeychain,
+            localStaticKey: aliceKey
+        )
+
+        let bob = NoiseSession(
+            peerID: PeerID(str: "bob-test"),
+            role: .responder,
+            keychain: trackingKeychain,
+            localStaticKey: bobKey
+        )
+
+        // Perform handshake
+        let msg1 = try alice.startHandshake()
+        let msg2 = try bob.processHandshakeMessage(msg1)!
+        let msg3 = try alice.processHandshakeMessage(msg2)!
+        _ = try bob.processHandshakeMessage(msg3)
+
+        // In Noise XX pattern handshake:
+        // - Message 1 (initiator): e token only (no DH)
+        // - Message 2 (responder): e, ee, s, es tokens (2 DH operations: ee, es)
+        // - Message 3 (initiator): s, se tokens (1 DH operation: se)
+        // Total in writeMessage: 3 DH operations (ee, es, se)
+        //
+        // In readMessage (performDHOperation):
+        // - After msg1: no DH
+        // - After msg2: ee, es (2 DH operations)
+        // - After msg3: se (1 DH operation)
+        // Total in performDHOperation: 3 DH operations
+        //
+        // Grand total: 6 DH operations requiring secureClear
+        //
+        // Note: .ss pattern is only used in certain handshake patterns, not XX
+        let expectedMinimumCalls = 6
+        #expect(
+            trackingKeychain.secureClearDataCallCount >= expectedMinimumCalls,
+            "Expected at least \(expectedMinimumCalls) secureClear calls for DH secrets, got \(trackingKeychain.secureClearDataCallCount)"
+        )
+    }
+
+    @Test func encryptionWorksAfterSecureClear() throws {
+        // Verify that encryption/decryption still works correctly after adding secureClear
+        let trackingKeychain = TrackingMockKeychain()
+
+        let aliceKey = Curve25519.KeyAgreement.PrivateKey()
+        let bobKey = Curve25519.KeyAgreement.PrivateKey()
+
+        let alice = NoiseSession(
+            peerID: PeerID(str: "alice-test-enc"),
+            role: .initiator,
+            keychain: trackingKeychain,
+            localStaticKey: aliceKey
+        )
+
+        let bob = NoiseSession(
+            peerID: PeerID(str: "bob-test-enc"),
+            role: .responder,
+            keychain: trackingKeychain,
+            localStaticKey: bobKey
+        )
+
+        // Perform handshake
+        let msg1 = try alice.startHandshake()
+        let msg2 = try bob.processHandshakeMessage(msg1)!
+        let msg3 = try alice.processHandshakeMessage(msg2)!
+        _ = try bob.processHandshakeMessage(msg3)
+
+        // Verify both sessions are established
+        #expect(alice.isEstablished())
+        #expect(bob.isEstablished())
+
+        // Verify secureClear was called (basic sanity check)
+        #expect(trackingKeychain.secureClearDataCallCount > 0)
+
+        // Test encryption from Alice to Bob
+        let plaintext1 = "Hello from Alice after secureClear!".data(using: .utf8)!
+        let ciphertext1 = try alice.encrypt(plaintext1)
+        let decrypted1 = try bob.decrypt(ciphertext1)
+        #expect(decrypted1 == plaintext1)
+
+        // Test encryption from Bob to Alice
+        let plaintext2 = "Hello from Bob after secureClear!".data(using: .utf8)!
+        let ciphertext2 = try bob.encrypt(plaintext2)
+        let decrypted2 = try alice.decrypt(ciphertext2)
+        #expect(decrypted2 == plaintext2)
+
+        // Test multiple messages to verify cipher state is correct
+        for i in 1...10 {
+            let msg = "Message \(i) from Alice".data(using: .utf8)!
+            let cipher = try alice.encrypt(msg)
+            let dec = try bob.decrypt(cipher)
+            #expect(dec == msg)
+        }
+    }
+
+    @Test func secureClearCalledInBothWriteAndReadPaths() throws {
+        // Verify secureClear is called in both writeMessage and readMessage paths
+        // We do this by checking the count increases at each step
+
+        let aliceKeychain = TrackingMockKeychain()
+        let bobKeychain = TrackingMockKeychain()
+
+        let aliceKey = Curve25519.KeyAgreement.PrivateKey()
+        let bobKey = Curve25519.KeyAgreement.PrivateKey()
+
+        let alice = NoiseSession(
+            peerID: PeerID(str: "alice-paths"),
+            role: .initiator,
+            keychain: aliceKeychain,
+            localStaticKey: aliceKey
+        )
+
+        let bob = NoiseSession(
+            peerID: PeerID(str: "bob-paths"),
+            role: .responder,
+            keychain: bobKeychain,
+            localStaticKey: bobKey
+        )
+
+        // Message 1: Alice writes (e token only, no DH)
+        let msg1 = try alice.startHandshake()
+        let aliceCountAfterMsg1 = aliceKeychain.secureClearDataCallCount
+        // No DH in message 1 for initiator
+        #expect(aliceCountAfterMsg1 == 0, "No DH secrets in message 1 write")
+
+        // Bob reads message 1 (no DH) and writes message 2 (ee, es DH operations)
+        let msg2 = try bob.processHandshakeMessage(msg1)!
+        let bobCountAfterMsg2 = bobKeychain.secureClearDataCallCount
+        // Bob should have cleared secrets for: ee (read), es (read), ee (write), es (write)
+        #expect(bobCountAfterMsg2 >= 2, "Bob should clear DH secrets when processing/writing message 2")
+
+        // Alice reads message 2 (ee, es) and writes message 3 (se)
+        let msg3 = try alice.processHandshakeMessage(msg2)!
+        let aliceCountAfterMsg3 = aliceKeychain.secureClearDataCallCount
+        // Alice should have cleared: ee (read), es (read), se (write)
+        #expect(aliceCountAfterMsg3 >= 3, "Alice should clear DH secrets when processing/writing message 3")
+
+        // Bob reads message 3 (se)
+        _ = try bob.processHandshakeMessage(msg3)
+        let bobFinalCount = bobKeychain.secureClearDataCallCount
+        // Bob should have additionally cleared: se (read)
+        #expect(bobFinalCount > bobCountAfterMsg2, "Bob should clear DH secrets when processing message 3")
     }
 }
